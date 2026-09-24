@@ -30,6 +30,7 @@ class EpisodeAwareSampler:
         drop_n_first_frames: int = 0,
         drop_n_last_frames: int = 0,
         shuffle: bool = False,
+        absolute_to_relative_idx: dict[int, int] | None = None,
     ):
         """Sampler that optionally incorporates episode boundary information.
 
@@ -41,6 +42,7 @@ class EpisodeAwareSampler:
             drop_n_first_frames: Number of frames to drop from the start of each episode.
             drop_n_last_frames: Number of frames to drop from the end of each episode.
             shuffle: Whether to shuffle the indices.
+            absolute_to_relative_idx: Optional mapping from absolute dataset frame index to relative HF dataset index.
         """
         if drop_n_first_frames < 0:
             raise ValueError(f"drop_n_first_frames must be >= 0, got {drop_n_first_frames}")
@@ -63,7 +65,12 @@ class EpisodeAwareSampler:
                         drop_n_last_frames,
                     )
                     continue
-                indices.extend(range(start_index + drop_n_first_frames, end_index - drop_n_last_frames))
+                abs_range = range(start_index + drop_n_first_frames, end_index - drop_n_last_frames)
+                if absolute_to_relative_idx is not None:
+                    mapped_range = [absolute_to_relative_idx[abs_idx] for abs_idx in abs_range]
+                    indices.extend(mapped_range)
+                else:
+                    indices.extend(abs_range)
 
         if not indices:
             raise ValueError(

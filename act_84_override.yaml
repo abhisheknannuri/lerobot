@@ -1,0 +1,11 @@
+dataset:
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    random_order: false
+    tfs:
+      resize:
+        type: Resize
+        weight: 1.0
+        kwargs:
+          size: [84, 84]

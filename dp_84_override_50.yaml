@@ -1,0 +1,12 @@
+dataset:
+  episodes: [0, 17, 20, 26, 33, 35, 41, 42, 43, 44, 75, 83, 86, 91, 98, 111, 113, 120, 122, 136, 142, 153, 158, 165, 166, 168, 169, 170, 177, 182, 184, 188, 193, 198, 199, 200, 203, 206, 207, 215, 231, 237, 243, 245, 251, 252, 257, 272, 278, 291]
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    random_order: false
+    tfs:
+      resize:
+        type: Resize
+        weight: 1.0
+        kwargs:
+          size: [256, 256]

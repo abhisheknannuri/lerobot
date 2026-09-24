@@ -1,0 +1,49 @@
+dataset:
+  image_transforms:
+    enable: true
+    # Must equal the total number of entries under `tfs` below.
+    # draccus REPLACES the whole `tfs` dict from this yaml (verified empirically - it does
+    # NOT merge with package defaults). RandomSubsetApply then samples `max_num_transforms`
+    # transforms WITHOUT replacement from this dict. Setting it equal to len(tfs) forces
+    # every listed transform (including resize) to run on every single frame, guaranteeing
+    # deterministic resize (required - mixed image sizes in a batch will crash torch.stack).
+    max_num_transforms: 3
+    random_order: false
+    tfs:
+      # Not a package default - this is your real camera's native resolution
+      # (verified: cam_right_wrist / cam_left_wrist are both 256x256 in your dataset's
+      # meta/info.json). Using native res = no resize computation at all, max detail kept.
+      resize:
+        type: Resize
+        weight: 1.0
+        kwargs:
+          size: [256, 256]
+      # PACKAGE DEFAULT (lerobot/transforms/transforms.py ImageTransformsConfig) - unchanged.
+      brightness:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          brightness: [0.8, 1.2]
+      # PACKAGE DEFAULT - unchanged.
+      contrast:
+        type: ColorJitter
+        weight: 1.0
+        kwargs:
+          contrast: [0.8, 1.2]
+      # PACKAGE DEFAULT - unchanged.
+      # hue:
+      #   type: ColorJitter
+      #   weight: 1.0
+      #   kwargs:
+      #     hue: [-0.05, 0.05]
+      # PACKAGE DEFAULT - unchanged.
+      sharpness:
+        type: SharpnessJitter
+        weight: 1.0
+        kwargs:
+          sharpness: [0.5, 1.5]
+      # saturation and affine (package defaults also exist for these) intentionally
+      # omitted - see chat discussion. Add back if you want them:
+      #   saturation: {type: ColorJitter, weight: 1.0, kwargs: {saturation: [0.5, 1.5]}}
+      #   affine: {type: RandomAffine, weight: 1.0, kwargs: {degrees: [-5.0, 5.0], translate: [0.05, 0.05]}}
+      # If you add them back, bump max_num_transforms to match the new total count.

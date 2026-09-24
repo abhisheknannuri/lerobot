@@ -176,3 +176,20 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+
+# ============================= CUSTOM Files Ignore ===============================
+
+# Sub task Visualization image folders
+subtask_vi*
+
+# Temp folder (Contains temporary scripts and test files)
+temp/
+SARM_DEBUG/
+
+# Editor/script backup files
+*.bak
+
+# Large model export artifacts
+custom_scripts/model_inspection/*.onnx
+custom_scripts/model_inspection/*.onnx.data

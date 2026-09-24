@@ -103,6 +103,19 @@ class DiffusionConfig(PreTrainedConfig):
     horizon: int = 64
     n_action_steps: int = 32
 
+    # Relative actions: converts absolute actions to relative (relative to state).
+    # Mirrors the ACT/pi0/pi05/pi0_fast configs (see configuration_act.py) - these
+    # fields are read generically (via getattr/hasattr, not an isinstance check) by
+    # lerobot_train.py's relative_actions_processor wiring and by factory.py's
+    # make_policy() (which populates action_feature_names from dataset metadata),
+    # so declaring them here is sufficient to make `--policy.use_relative_actions=true`
+    # work for Diffusion with no other changes to the training pipeline itself.
+    use_relative_actions: bool = False
+    # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Populated at runtime from dataset metadata by make_policy.
+    action_feature_names: list[str] | None = None
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -208,6 +221,11 @@ class DiffusionConfig(PreTrainedConfig):
                 "The horizon should be an integer multiple of the downsampling factor (which is determined "
                 f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
             )
+
+    @property
+    def chunk_size(self) -> int:
+        """Alias for horizon, needed by RA-BC sample weighting factory."""
+        return self.horizon
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(

@@ -392,6 +392,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=active_cfg.drop_n_last_frames,
             shuffle=True,
+            absolute_to_relative_idx=dataset.reader._absolute_to_relative_idx if dataset.reader is not None else None,
         )
     else:
         shuffle = True

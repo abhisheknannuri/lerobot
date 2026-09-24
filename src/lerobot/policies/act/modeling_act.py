@@ -134,34 +134,59 @@ class ACTPolicy(PreTrainedPolicy):
         actions = self.model(batch)[0]
         return actions
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
-        """Run the batch through the model and compute the loss for training or validation."""
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+        """Run the batch through the model and compute the loss for training or validation.
+
+        Args:
+            reduction: "mean" returns a scalar loss (default). "none" returns per-sample
+                losses of shape (B,), required for RA-BC sample weighting.
+        """
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
-        valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
-        num_valid = valid_mask.sum() * abs_err.shape[-1]
-        l1_loss = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
+        abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")  # (B, chunk_size, action_dim)
+        valid_mask = ~batch["action_is_pad"].unsqueeze(-1)  # (B, chunk_size, 1)
 
-        loss_dict = {"l1_loss": l1_loss.item()}
-        if self.config.use_vae:
-            # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
-            # each dimension independently, we sum over the latent dimension to get the total
-            # KL-divergence per batch element, then take the mean over the batch.
-            # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
-            mean_kld = (
-                (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
-            )
-            loss_dict["kld_loss"] = mean_kld.item()
-            loss = l1_loss + mean_kld * self.config.kl_weight
+        if reduction == "none":
+            # Per-sample L1: reduce over (chunk_size, action_dim), keep batch dim
+            num_valid_per_sample = valid_mask.sum(dim=1) * abs_err.shape[-1]  # (B, 1)
+            per_sample_l1 = (
+                (abs_err * valid_mask).sum(dim=(1, 2)) / num_valid_per_sample.squeeze(-1).clamp_min(1)
+            )  # (B,)
+
+            loss_dict = {"l1_loss": per_sample_l1.mean().item()}
+            if self.config.use_vae:
+                per_sample_kld = (
+                    (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1)
+                )  # (B,)
+                loss_dict["kld_loss"] = per_sample_kld.mean().item()
+                per_sample_loss = per_sample_l1 + per_sample_kld * self.config.kl_weight
+            else:
+                per_sample_loss = per_sample_l1
+
+            return per_sample_loss, loss_dict
         else:
-            loss = l1_loss
+            num_valid = valid_mask.sum() * abs_err.shape[-1]
+            l1_loss = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
 
-        return loss, loss_dict
+            loss_dict = {"l1_loss": l1_loss.item()}
+            if self.config.use_vae:
+                # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
+                # each dimension independently, we sum over the latent dimension to get the total
+                # KL-divergence per batch element, then take the mean over the batch.
+                # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
+                mean_kld = (
+                    (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
+                )
+                loss_dict["kld_loss"] = mean_kld.item()
+                loss = l1_loss + mean_kld * self.config.kl_weight
+            else:
+                loss = l1_loss
+
+            return loss, loss_dict
 
 
 class ACTTemporalEnsembler:

@@ -165,7 +165,10 @@ def _make_rabc_weighter(
         if dataset_root:
             progress_path = str(Path(dataset_root) / "sarm_progress.parquet")
         elif dataset_repo_id:
-            progress_path = f"hf://datasets/{dataset_repo_id}/sarm_progress.parquet"
+            if Path(dataset_repo_id).exists() or dataset_repo_id.startswith(("/", ".")):
+                progress_path = str(Path(dataset_repo_id) / "sarm_progress.parquet")
+            else:
+                progress_path = f"hf://datasets/{dataset_repo_id}/sarm_progress.parquet"
         else:
             raise ValueError(
                 "RABC sample weighting requires 'progress_path' to be set, "

@@ -286,7 +286,7 @@ class VideoAnnotator:
             print(f"Loading model: {model_name}...")
 
             self.model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-                model_name, torch_dtype=torch_dtype, device_map=device, trust_remote_code=True
+                model_name, torch_dtype=torch_dtype, device_map="auto", trust_remote_code=True
             )
 
             self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
@@ -476,15 +476,36 @@ def timestamp_to_seconds(timestamp: str) -> float:
         return int(parts[0])
 
 
+# def extract_frame(video_path: Path, timestamp: float) -> np.ndarray | None:
+#     """Extract a single frame from video at given timestamp."""
+#     cap = cv2.VideoCapture(str(video_path))
+#     if not cap.isOpened():
+#         return None
+#     cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+#     ret, frame = cap.read()
+#     cap.release()
+#     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if ret else None
+
+
 def extract_frame(video_path: Path, timestamp: float) -> np.ndarray | None:
-    """Extract a single frame from video at given timestamp."""
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
+    """Extract a single frame from video at given timestamp using PyAV (supports AV1)."""
+    try:
+        import av
+
+        container = av.open(str(video_path))
+        stream = container.streams.video[0]
+        # Seek to the target timestamp
+        target_pts = int(timestamp / stream.time_base)
+        container.seek(target_pts, stream=stream)
+        for frame in container.decode(video=0):
+            img = frame.to_ndarray(format="rgb24")
+            container.close()
+            return img
+        container.close()
         return None
-    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
-    ret, frame = cap.read()
-    cap.release()
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if ret else None
+    except Exception:
+        return None
+
 
 
 def draw_timeline(ax, subtasks, total_duration, colors):
@@ -905,6 +926,7 @@ def worker_process_episodes(
     gpu_id: int,
     episode_indices: list[int],
     repo_id: str,
+    dataset_root: str | Path | None,
     video_key: str,
     sparse_subtask_list: list[str],
     dense_subtask_list: list[str] | None,
@@ -913,7 +935,7 @@ def worker_process_episodes(
 ) -> tuple[dict, dict | None]:
     """Worker for parallel processing across GPUs."""
     device = f"cuda:{gpu_id}"
-    dataset = LeRobotDataset(repo_id, download_videos=False)
+    dataset = LeRobotDataset(repo_id, root=dataset_root, download_videos=False)
 
     sparse_annotator = VideoAnnotator(sparse_subtask_list, model_name, device, torch_dtype)
     dense_annotator = (
@@ -951,6 +973,8 @@ def worker_process_episodes(
 def main():
     parser = argparse.ArgumentParser(description="SARM-style subtask annotation using local GPU (Qwen3-VL)")
     parser.add_argument("--repo-id", type=str, required=True, help="HuggingFace dataset repository ID")
+    parser.add_argument("--root", type=str, default=None, help="Local dataset root directory")
+    parser.add_argument("--mode", type=str, default="hub", help="Dataset mode (local/hub)")
     parser.add_argument(
         "--sparse-subtasks", type=str, default=None, help="Comma-separated sparse subtask names"
     )
@@ -1000,7 +1024,7 @@ def main():
 
     # Load dataset first (needed for both annotation and visualization)
     print(f"Loading dataset: {args.repo_id}")
-    dataset = LeRobotDataset(args.repo_id, download_videos=True)
+    dataset = LeRobotDataset(args.repo_id, root=args.root, download_videos=True if args.root is None else False)
     fps = dataset.fps
 
     if not dataset.meta.video_keys:
@@ -1095,6 +1119,7 @@ def main():
                         gpu_ids[w],
                         episodes_per_worker[w],
                         args.repo_id,
+                        args.root,
                         video_key,
                         sparse_subtask_list,
                         dense_subtask_list,

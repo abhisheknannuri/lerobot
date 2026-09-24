@@ -147,16 +147,20 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
-        """Run the batch through the model and compute the loss for training or validation."""
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, None]:
+        """Run the batch through the model and compute the loss for training or validation.
+
+        Args:
+            reduction: "mean" returns a scalar loss (default). "none" returns per-sample
+                losses of shape (B,), required for RA-BC sample weighting.
+        """
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        loss = self.diffusion.compute_loss(batch)
-        # no output_dict so returning None
+        loss = self.diffusion.compute_loss(batch, reduction=reduction)
         return loss, None
 
 
@@ -319,7 +323,7 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor], reduction: str = "mean") -> Tensor:
         """
         This function expects `batch` to have (at least):
         {
@@ -332,6 +336,9 @@ class DiffusionModel(nn.Module):
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
         }
+
+        Args:
+            reduction: "mean" returns a scalar loss. "none" returns per-sample losses (B,).
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
@@ -370,21 +377,34 @@ class DiffusionModel(nn.Module):
         else:
             raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
 
-        loss = F.mse_loss(pred, target, reduction="none")
+        loss = F.mse_loss(pred, target, reduction="none")  # (B, horizon, action_dim)
 
-        # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
-        if self.config.do_mask_loss_for_padding:
-            if "action_is_pad" not in batch:
-                raise ValueError(
-                    "You need to provide 'action_is_pad' in the batch when "
-                    f"{self.config.do_mask_loss_for_padding=}."
-                )
-            in_episode_bound = ~batch["action_is_pad"]
-            mask = in_episode_bound.unsqueeze(-1)
-            num_valid = mask.sum() * loss.shape[-1]
-            return (loss * mask).sum() / num_valid.clamp_min(1)
-
-        return loss.mean()
+        if reduction == "none":
+            # Per-sample loss: reduce over (horizon, action_dim), keep batch dim
+            if self.config.do_mask_loss_for_padding:
+                if "action_is_pad" not in batch:
+                    raise ValueError(
+                        "You need to provide 'action_is_pad' in the batch when "
+                        f"{self.config.do_mask_loss_for_padding=}."
+                    )
+                in_episode_bound = ~batch["action_is_pad"]
+                mask = in_episode_bound.unsqueeze(-1)  # (B, horizon, 1)
+                num_valid_per_sample = mask.sum(dim=1) * loss.shape[-1]  # (B, 1)
+                return (loss * mask).sum(dim=(1, 2)) / num_valid_per_sample.squeeze(-1).clamp_min(1)  # (B,)
+            return loss.mean(dim=(1, 2))  # (B,)
+        else:
+            # Original mean reduction
+            if self.config.do_mask_loss_for_padding:
+                if "action_is_pad" not in batch:
+                    raise ValueError(
+                        "You need to provide 'action_is_pad' in the batch when "
+                        f"{self.config.do_mask_loss_for_padding=}."
+                    )
+                in_episode_bound = ~batch["action_is_pad"]
+                mask = in_episode_bound.unsqueeze(-1)
+                num_valid = mask.sum() * loss.shape[-1]
+                return (loss * mask).sum() / num_valid.clamp_min(1)
+            return loss.mean()
 
 
 class SpatialSoftmax(nn.Module):

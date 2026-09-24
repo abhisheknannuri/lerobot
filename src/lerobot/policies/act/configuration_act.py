@@ -118,6 +118,34 @@ class ACTConfig(PreTrainedConfig):
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
 
+    # Relative (chunk-anchor-relative) action space - mirrors OpenPI's DeltaActions/
+    # AbsoluteActions and pi0/pi05's use_relative_actions (see configuration_pi0.py).
+    # When True, RelativeActionsProcessorStep/AbsoluteActionsProcessorStep are wired
+    # into the pre/post-processor pipelines (see processor_act.py): every action in a
+    # training chunk (shape (B, chunk_size, action_dim)) has the SAME single anchor
+    # state (the observation.state at the chunk's own timestep) subtracted from it -
+    # i.e. delta[t+k] = action[t+k] - state[t] for every k in the chunk, not a rolling
+    # per-frame diff (action[t+k] - state[t+k]). This is what makes multi-step chunk
+    # execution (n_action_steps > 1) mathematically well-defined: reconstructing
+    # absolute[t+k] = predicted_delta[k] + state[t] uses the one anchor state the
+    # target was actually defined against, for every k - not the state re-measured at
+    # tick t+k, which only matches at k=0. See dataset_tools.recompute_stats(...,
+    # relative_action=True) / `lerobot-edit-dataset --operation.type recompute_stats
+    # --operation.relative_action true` - the ACTION normalization stats MUST be
+    # recomputed on this transformed distribution before training with this enabled;
+    # they are NOT interchangeable with plain-absolute-action stats.
+    use_relative_actions: bool = False
+    # Dims kept absolute even when use_relative_actions=True - matched against
+    # `action_feature_names` (case-sensitive substring match, see
+    # RelativeActionsProcessorStep._build_mask). Defaults to excluding the gripper,
+    # matching pi0/pi05's default and this project's own delta-action convention
+    # (see trossen_real/scripts/convert_to_delta_joint_dataset.py).
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Per-dimension action names from dataset metadata, used to build the
+    # exclude_joints mask above. Required (non-None) for relative_exclude_joints to
+    # have any effect - if None, ALL dims are converted to relative, gripper included.
+    action_feature_names: list[str] | None = None
+
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0

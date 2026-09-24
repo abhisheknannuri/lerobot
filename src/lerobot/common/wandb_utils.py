@@ -71,8 +71,14 @@ def get_wandb_run_id_from_filesystem(log_dir: Path) -> str:
 
 
 def get_safe_wandb_artifact_name(name: str):
-    """WandB artifacts don't accept ":" or "/" in their name."""
-    return name.replace(":", "_").replace("/", "_")
+    """WandB artifacts don't accept ":" or "/" in their name and must be <= 128 chars."""
+    safe_name = name.replace(":", "_").replace("/", "_")
+    if len(safe_name) > 128:
+        import hashlib
+        h = hashlib.md5(safe_name.encode('utf-8')).hexdigest()[:8]
+        safe_name = f"{safe_name[:100]}_{h}_{safe_name[-15:]}"
+        safe_name = safe_name[:128]
+    return safe_name
 
 
 class WandBLogger:

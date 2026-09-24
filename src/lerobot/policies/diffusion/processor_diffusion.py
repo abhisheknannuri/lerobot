@@ -19,11 +19,13 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
@@ -64,10 +66,26 @@ def make_diffusion_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    # Mirrors ACT's own processor_act.py wiring (added 2026-09-03, confirmed
+    # this was previously entirely missing for Diffusion - `use_relative_actions`
+    # existed as a config field but nothing ever constructed/attached the
+    # actual RelativeActionsProcessorStep, so it silently had no effect).
+    # OpenPI order (see openpi/src/openpi/training/data_loader.py::transform_dataset
+    # and pi0/processor_pi0.py, which this mirrors exactly): raw -> relative ->
+    # normalize -> model -> unnormalize -> absolute. relative_step is a no-op
+    # (pass-through) whenever config.use_relative_actions=False, so this is
+    # behavior-preserving by default.
+    relative_step = RelativeActionsProcessorStep(
+        enabled=getattr(config, "use_relative_actions", False),
+        exclude_joints=getattr(config, "relative_exclude_joints", []),
+        action_names=getattr(config, "action_feature_names", None),
+    )
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+        relative_step,
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
@@ -77,6 +95,9 @@ def make_diffusion_pre_post_processors(
     output_steps = [
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+        ),
+        AbsoluteActionsProcessorStep(
+            enabled=getattr(config, "use_relative_actions", False), relative_step=relative_step
         ),
         DeviceProcessorStep(device="cpu"),
     ]
