@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import zlib
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -399,10 +400,45 @@ def _load_policy(checkpoint: str, device_override: str | None, n_action_steps_ov
 def _decode_image(payload: dict) -> torch.Tensor:
     """{"shape":[H,W,3], "dtype":"uint8", "data_b64": ...} -> (C,H,W) float32 tensor in [0,1] -
     exactly matching `video_utils.py`'s own `permute(2,0,1)` + `/255` convention, so live camera
-    frames are formatted IDENTICALLY to how LeRobotDataset itself would have loaded them."""
-    raw = base64.b64decode(payload["data_b64"])
-    arr = np.frombuffer(raw, dtype=np.dtype(payload["dtype"])).reshape(payload["shape"])
-    return torch.from_numpy(arr.copy()).permute(2, 0, 1).contiguous().float() / 255.0
+    frames are formatted IDENTICALLY to how LeRobotDataset itself would have loaded them.
+
+    An optional `"encoding"` key says how `data_b64` was packed. It defaults to
+    `"raw"`, so a client that never sets it behaves exactly as before:
+
+    * `raw`  - uncompressed HWC bytes. ~256 KB per 256x256 frame on the wire.
+    * `zlib` - the same bytes, deflated. Lossless, ~3.3x smaller, for when the
+      link is the bottleneck but you want bit-identical pixels.
+    * `jpeg` - a JPEG file. ~15x smaller at quality 95, and lossy - but measured
+      on real wrist-cam frames, q95 distorts LESS than the AV1 crf=30 the
+      LeRobot dataset itself is stored in (mean abs err 0.79 vs 1.39, PSNR
+      45.8 dB vs 43.1 dB), so it does not take the policy further from its
+      training distribution than the training data already was.
+
+    The client encodes RGB; `cv2.imdecode` returns BGR, hence the flip.
+    """
+    blob = base64.b64decode(payload["data_b64"])
+    encoding = payload.get("encoding", "raw")
+
+    if encoding == "jpeg":
+        import cv2  # only needed on this path
+
+        bgr = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("could not decode the JPEG image payload")
+        arr = bgr[:, :, ::-1]  # BGR -> RGB, matching the raw path's channel order
+    else:
+        if encoding == "zlib":
+            blob = zlib.decompress(blob)
+        elif encoding != "raw":
+            raise ValueError(f"unknown image encoding {encoding!r} (expected raw, zlib or jpeg)")
+        arr = np.frombuffer(blob, dtype=np.dtype(payload["dtype"])).reshape(payload["shape"])
+
+    expected = tuple(payload["shape"])
+    if tuple(arr.shape) != expected:
+        raise ValueError(f"decoded image is {tuple(arr.shape)}, but payload declares {expected}")
+    # .copy(): np.frombuffer gives a READ-ONLY view, and torch.from_numpy on one
+    # produces a tensor whose writes are undefined behaviour (and warns).
+    return torch.from_numpy(np.ascontiguousarray(arr).copy()).permute(2, 0, 1).contiguous().float() / 255.0
 
 
 def _action_queue_len(policy) -> int | None:
@@ -503,7 +539,113 @@ def _predict(obs: dict) -> dict:
     }
 
 
+def _predict_chunk_supported() -> bool:
+    """Whether `/predict_chunk` reproduces `/predict` for the loaded policy.
+
+    Same two exclusions `_predict_chunk()` enforces, exposed on `/health` so a
+    client can decide before it starts a run rather than after a failed POST.
+    """
+    if state.policy is None:
+        return False
+    if getattr(state.policy.config, "temporal_ensemble_coeff", None) is not None:
+        return False
+    if state.relative_step is not None and state.relative_step.enabled:
+        return False
+    return True
+
+
+def _predict_chunk(obs: dict, n_steps: int | None = None) -> dict:
+    """Return a whole action chunk in one call, instead of one action per call.
+
+    WHY: `/predict` calls `select_action()`, which only runs the model when its
+    internal queue is empty and pops a cached step otherwise. With
+    `n_action_steps=15` that means 14 of every 15 requests upload ~512 KB of
+    images purely to trigger a `deque.popleft()` on this side. For a client on
+    the far end of a network (or an SSH tunnel), those 14 round trips are the
+    entire control-loop budget. This endpoint hands the client the same actions
+    at once so it can run its own queue locally.
+
+    IDENTICAL, NOT APPROXIMATE: `ACTPolicy.select_action()`'s refill path is
+    literally `predict_action_chunk(batch)[:, : n_action_steps]` followed by
+    `popleft()` (modeling_act.py:127-133), which is what this computes. A client
+    consuming this chunk one step per tick executes exactly the actions
+    `/predict` would have returned.
+
+    Refused for two configurations where that equivalence does not hold, rather
+    than silently returning different actions:
+
+    * `temporal_ensemble_coeff is not None` - there is no queue at all; every
+      tick runs the model and blends overlapping chunks through
+      `temporal_ensembler.update()` (modeling_act.py:120-123). Chunking would
+      throw the ensembling away.
+    * `use_relative_actions=True` - each returned step must be reconstructed
+      against the anchor state cached at chunk-inference time, and the client's
+      per-tick reconstruction uses its own freshly measured state. Making these
+      agree needs the anchor shipped and applied client-side; until that is
+      built and tested, refuse.
+    """
+    if state.policy is None:
+        raise RuntimeError("no policy loaded")
+    if getattr(state.policy.config, "temporal_ensemble_coeff", None) is not None:
+        raise RuntimeError(
+            "/predict_chunk is not valid for a temporal-ensembling checkpoint "
+            "(temporal_ensemble_coeff is set): select_action() blends overlapping chunks "
+            "every tick and keeps no queue, so a chunk cannot reproduce it. Use /predict."
+        )
+    if state.relative_step is not None and state.relative_step.enabled:
+        raise RuntimeError(
+            "/predict_chunk is not implemented for use_relative_actions=True checkpoints "
+            "(each step needs the chunk's anchor state to reconstruct against). Use /predict."
+        )
+
+    limit = int(state.policy.config.n_action_steps)
+    if n_steps is not None:
+        n_steps = int(n_steps)
+        if n_steps < 1:
+            raise ValueError(f"n_steps must be >= 1, got {n_steps}")
+        limit = min(n_steps, int(state.policy.config.chunk_size))
+
+    model_input = {}
+    for key in state.non_image_keys:
+        if key not in obs:
+            if key not in state.dead_weight_keys:
+                raise KeyError(key)
+            model_input[key] = torch.tensor(_dead_weight_placeholder(key), dtype=torch.float32).unsqueeze(0)
+            continue
+        model_input[key] = torch.tensor(obs[key], dtype=torch.float32).unsqueeze(0)
+    for key in state.image_keys:
+        model_input[key] = _decode_image(obs[key]).unsqueeze(0)
+
+    with torch.no_grad():
+        model_input = state.preprocessor(model_input)
+        chunk_normalized = state.policy.predict_action_chunk(model_input)  # (1, chunk_size, action_dim)
+        chunk_normalized = chunk_normalized[:, :limit]
+        # Postprocess step by step, exactly as /predict does for each popped
+        # action - a postprocessor step may be stateful, so feeding it the whole
+        # chunk at once is not the same operation.
+        actions, actions_norm = [], []
+        for i in range(chunk_normalized.shape[1]):
+            step_norm = chunk_normalized[:, i]                      # (1, action_dim)
+            actions.append(state.postprocessor(step_norm).squeeze(0).cpu().tolist())
+            actions_norm.append(step_norm.squeeze(0).cpu().tolist())
+
+    # The client's queue replaces this server-side one; leaving a half-consumed
+    # server queue around would make a later /predict return a stale action.
+    state.policy.reset()
+    state.cached_anchor_state = None
+
+    return {"actions": actions, "actions_normalized": actions_norm, "n": len(actions)}
+
+
 class _Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 so the connection is KEPT ALIVE between requests. The
+    # BaseHTTPRequestHandler default is HTTP/1.0, which closes the socket after
+    # every response - so every control tick paid a fresh TCP handshake, and
+    # through an SSH tunnel a fresh tunnelled channel on top of that. Safe here
+    # because `_send_json()` is the only writer and it always sets
+    # Content-Length, which is what HTTP/1.1 needs to delimit a response.
+    protocol_version = "HTTP/1.1"
+
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -525,12 +667,24 @@ class _Handler(BaseHTTPRequestHandler):
                 "device": str(state.policy.config.device) if state.policy else None,
                 "likely_action_space": state.likely_action_space,
                 "action_space_source": state.action_space_source,
+                # Lets a client turn chunked fetching on only when this server
+                # actually supports it, instead of probing with a failed POST.
+                "supports_predict_chunk": _predict_chunk_supported(),
+                # Image payload encodings this server can decode, so a client
+                # only turns compression on when the other end understands it.
+                "supported_image_encodings": ["raw", "zlib", "jpeg"],
             })
         else:
             self._send_json({"error": f"unknown GET path {self.path}"}, status=404)
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/reset":
+            # Drain any body before responding - see the note at the bottom of
+            # this method on why an unread body corrupts a keep-alive socket.
+            try:
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            except Exception:
+                pass
             if state.policy is not None:
                 state.policy.reset()
             # Not strictly required for correctness (the queue is now empty,
@@ -550,6 +704,23 @@ class _Handler(BaseHTTPRequestHandler):
                 logger.exception("predict failed")
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path == "/predict_chunk":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                result = _predict_chunk(body, body.pop("n_steps", None))
+                self._send_json(result)
+            except Exception as exc:
+                logger.exception("predict_chunk failed")
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        # The body must be drained even on an unknown path: with HTTP/1.1
+        # keep-alive the socket is reused, and unread bytes would be parsed as
+        # the start of the next request.
+        try:
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        except Exception:
+            pass
         self._send_json({"error": f"unknown POST path {self.path}"}, status=404)
 
     def log_message(self, fmt, *args) -> None:  # quieter default stdlib access log
