@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import zlib
 import json
 import logging
@@ -108,12 +109,63 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 
+def _hash_checkpoint_weights(checkpoint: str) -> tuple[str | None, list[str]]:
+    """sha256 over the checkpoint's WEIGHT FILES ONLY - a portable identity for
+    "which trained model is this", independent of where the server runs.
+
+    Deliberately excludes every non-weight file (config.json, train_config.json,
+    README, ...). Two reasons:
+
+      * `--n-action-steps` is an INFERENCE-TIME knob. It is applied to
+        `policy.config` after loading and never touches the weight files, so a
+        server started with a different value reports the SAME hash. That is
+        what makes this a checkpoint identity rather than a server-invocation
+        identity.
+      * config files carry absolute paths and timestamps from whichever machine
+        trained the model, which would make the hash non-portable.
+
+    The hash covers each weight file's RELATIVE name and its bytes, names
+    sorted, so a sharded checkpoint hashes stably and a renamed shard is caught.
+
+    Returns (hex digest, sorted relative filenames). (None, []) when the path
+    does not exist or holds no recognisable weight file - the caller decides
+    whether that is fatal.
+    """
+    root = Path(checkpoint)
+    if not root.exists():
+        return None, []
+    exts = {".safetensors", ".bin", ".pt", ".pth", ".ckpt"}
+    if root.is_file():
+        files = [root] if root.suffix in exts else []
+        base = root.parent
+    else:
+        files = sorted((q for q in root.rglob("*") if q.is_file() and q.suffix in exts),
+                       key=lambda q: str(q.relative_to(root)))
+        base = root
+    if not files:
+        return None, []
+    h = hashlib.sha256()
+    names = []
+    for fp in files:
+        rel = str(fp.relative_to(base))
+        names.append(rel)
+        h.update(rel.encode())
+        h.update(b"\0")
+        with open(fp, "rb") as fh:
+            for block in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(block)
+    return h.hexdigest(), names
+
+
 class _PolicyState:
     def __init__(self) -> None:
         self.policy = None
         self.preprocessor = None
         self.postprocessor = None
         self.checkpoint_path: str | None = None
+        # Content hash of the WEIGHTS ONLY - see _hash_checkpoint_weights().
+        self.weights_sha256: str | None = None
+        self.weights_files: list[str] = []
         self.non_image_keys: list[str] = []
         self.image_keys: list[str] = []
         # Heuristic guess only (see _detect_likely_action_space()) - the model
@@ -332,6 +384,17 @@ def _load_policy(checkpoint: str, device_override: str | None, n_action_steps_ov
     state.preprocessor = preprocessor
     state.postprocessor = postprocessor
     state.checkpoint_path = checkpoint
+    state.weights_sha256, state.weights_files = _hash_checkpoint_weights(checkpoint)
+    if state.weights_sha256 is None:
+        logging.warning(
+            "could not hash any weight file under %s - /health will report "
+            "weights_sha256=null and any client requiring base-policy provenance "
+            "will refuse to run against this server.", checkpoint,
+        )
+    else:
+        logging.info("checkpoint weights sha256=%s (%d file(s): %s)",
+                     state.weights_sha256, len(state.weights_files),
+                     ", ".join(state.weights_files))
     state.non_image_keys = non_image_keys
     state.image_keys = image_keys
     state.dead_weight_keys = dead_weight_keys
@@ -659,6 +722,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({
                 "loaded": state.policy is not None,
                 "checkpoint": state.checkpoint_path,
+                # Portable, weights-only content hash. Same trained model =>
+                # same value on any machine. Excludes --n-action-steps and every
+                # other inference-time knob. See _hash_checkpoint_weights().
+                "weights_sha256": state.weights_sha256,
+                "weights_files": state.weights_files,
                 "non_image_keys": state.non_image_keys,
                 "dead_weight_keys": sorted(state.dead_weight_keys),
                 "image_keys": state.image_keys,
