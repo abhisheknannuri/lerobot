@@ -177,6 +177,10 @@ class _PolicyState:
         # were absolute (or vice versa) - both are dangerous on real hardware.
         self.likely_action_space: str | None = None
         self.action_space_source: str | None = None
+        # The checkpoint's saved normalizer stats for `action` (min/max/mean/std
+        # per dim), so a client can check how it was trained - e.g. the infer
+        # app refuses raw gripper mode for binarized gripper labels.
+        self.action_stats: dict | None = None
         # `dataset_to_policy_features()` classifies EVERY `observation.*`
         # column in the training dataset's schema as a STATE-typed
         # `input_features` entry, regardless of whether the loaded POLICY
@@ -213,6 +217,18 @@ class _PolicyState:
 
 
 state = _PolicyState()
+
+
+def _action_stats(preprocessor) -> dict | None:
+    """min/max/mean/std of `action` from the checkpoint's normalizer, as lists."""
+    from lerobot.processor import NormalizerProcessorStep
+
+    norm_step = next((s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)), None)
+    stats = getattr(norm_step, "stats", {}) or {}
+    if "action" not in stats:
+        return None
+    return {k: np.asarray(v.detach().cpu() if hasattr(v, "detach") else v, dtype=np.float64).reshape(-1).tolist()
+            for k, v in stats["action"].items() if k in ("min", "max", "mean", "std")}
 
 
 def _detect_action_space_from_stats(preprocessor) -> str | None:
@@ -401,6 +417,7 @@ def _load_policy(checkpoint: str, device_override: str | None, n_action_steps_ov
     state.likely_action_space, state.action_space_source = _detect_likely_action_space(
         checkpoint, preprocessor, action_space_override
     )
+    state.action_stats = _action_stats(preprocessor)
     state.relative_step = next(
         (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)), None
     )
@@ -735,6 +752,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "device": str(state.policy.config.device) if state.policy else None,
                 "likely_action_space": state.likely_action_space,
                 "action_space_source": state.action_space_source,
+                "action_stats": state.action_stats,
                 # Lets a client turn chunked fetching on only when this server
                 # actually supports it, instead of probing with a failed POST.
                 "supports_predict_chunk": _predict_chunk_supported(),
